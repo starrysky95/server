@@ -34,6 +34,7 @@
 var config = require('config');
 var container = require('rhea');
 var logger = require('./logger');
+const operationContext = require('./operationContext');
 
 const cfgRabbitSocketOptions = config.get('activemq.connectOptions');
 
@@ -45,20 +46,20 @@ function connetPromise(reconnectOnConnectionError, closeCallback) {
       let conn = container.create_container().connect(cfgRabbitSocketOptions);
       let isConnected = false;
       conn.on('connection_open', function(context) {
-        logger.debug('[AMQP] connected');
+        operationContext.global.logger.debug('[AMQP] connected');
         isConnected = true;
         resolve(conn);
       });
       conn.on('connection_error', function(context) {
         //todo
-        logger.debug('[AMQP] connection_error %s', context.error);
+        operationContext.global.logger.debug('[AMQP] connection_error %s', context.error);
       });
       conn.on('connection_close', function() {
         //todo
-        logger.debug('[AMQP] conn close');
+        operationContext.global.logger.debug('[AMQP] conn close');
       });
       conn.on('disconnected', function(context) {
-        logger.error('[AMQP] disconnected %s', context.error && context.error.stack);
+        operationContext.global.logger.error('[AMQP] disconnected %s', context.error && context.error.stack);
         if (isConnected) {
           closeCallback();
         } else {
@@ -74,19 +75,13 @@ function connetPromise(reconnectOnConnectionError, closeCallback) {
     startConnect();
   });
 }
-function openSenderPromise(conn, name) {
+function openSenderPromise(conn, options) {
   return new Promise(function(resolve, reject) {
-    let options = {target: name};
     resolve(conn.open_sender(options));
   });
 }
-function openReceiverPromise(conn, name, autoaccept) {
+function openReceiverPromise(conn, options) {
   return new Promise(function(resolve, reject) {
-    let options = {source: name};
-    if (!autoaccept) {
-      options.credit_window = 0;
-      options.autoaccept = false;
-    }
     resolve(conn.open_receiver(options));
   });
 }

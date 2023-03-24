@@ -49,14 +49,19 @@ exports.readLicense = function*() {
 		mode: constants.LICENSE_MODE.None,
 		branding: false,
 		connections: constants.LICENSE_CONNECTIONS,
+		connectionsView: constants.LICENSE_CONNECTIONS,
 		customization: false,
+		advancedApi: false,
 		usersCount: 0,
+		usersViewCount: 0,
 		usersExpire: constants.LICENSE_EXPIRE_USERS_ONE_DAY,
 		hasLicense: false,
 		plugins: false,
 		buildDate: oBuildDate,
 		startDate: startDate,
-		endDate: null
+		endDate: null,
+		customerId: "",
+		alias: ""
 	}, null];
 };
 

@@ -35,7 +35,6 @@ var os = require('os');
 var path = require('path');
 var fs = require('fs');
 var url = require('url');
-var childProcess = require('child_process');
 var co = require('co');
 var config = require('config');
 var spawnAsync = require('@expo/spawn-async');
@@ -50,9 +49,12 @@ var logger = require('./../../Common/sources/logger');
 var constants = require('./../../Common/sources/constants');
 var baseConnector = require('./../../DocService/sources/baseConnector');
 const wopiClient = require('./../../DocService/sources/wopiClient');
+const taskResult = require('./../../DocService/sources/taskresult');
 var statsDClient = require('./../../Common/sources/statsdclient');
 var queueService = require('./../../Common/sources/taskqueueRabbitMQ');
 const formatChecker = require('./../../Common/sources/formatchecker');
+const operationContext = require('./../../Common/sources/operationContext');
+const tenantManager = require('./../../Common/sources/tenantManager');
 
 var cfgDownloadMaxBytes = configConverter.has('maxDownloadBytes') ? configConverter.get('maxDownloadBytes') : 100000000;
 var cfgDownloadTimeout = configConverter.has('downloadTimeout') ? configConverter.get('downloadTimeout') : 60;
@@ -62,8 +64,6 @@ var cfgFontDir = configConverter.get('fontDir');
 var cfgPresentationThemesDir = configConverter.get('presentationThemesDir');
 var cfgX2tPath = configConverter.get('x2tPath');
 var cfgDocbuilderPath = configConverter.get('docbuilderPath');
-var cfgDocbuilderAllFontsPath = configConverter.get('docbuilderAllFontsPath');
-var cfgDocbuilderCoreFontsPath = configConverter.get('docbuilderCoreFontsPath');
 var cfgArgs = configConverter.get('args');
 var cfgSpawnOptions = configConverter.get('spawnOptions');
 if (cfgSpawnOptions.env) {
@@ -74,8 +74,10 @@ var cfgInputLimits = configConverter.get('inputLimits');
 const cfgStreamWriterBufferSize = configConverter.get('streamWriterBufferSize');
 //cfgMaxRequestChanges was obtained as a result of the test: 84408 changes - 5,16 MB
 const cfgMaxRequestChanges = config.get('services.CoAuthoring.server.maxRequestChanges');
+const cfgForgottenFiles = config.get('services.CoAuthoring.server.forgottenfiles');
 const cfgForgottenFilesName = config.get('services.CoAuthoring.server.forgottenfilesname');
 const cfgNewFileTemplate = config.get('services.CoAuthoring.server.newFileTemplate');
+const cfgEditor = config.get('services.CoAuthoring.editor');
 
 //windows limit 512(2048) https://msdn.microsoft.com/en-us/library/6e3b887c.aspx
 //Ubuntu 14.04 limit 4096 http://underyx.me/2015/05/18/raising-the-maximum-number-of-file-descriptors.html
@@ -97,7 +99,7 @@ function TaskQueueDataConvert(task) {
   this.fileFrom = null;
   this.fileTo = null;
   this.title = cmd.getTitle();
-  if(constants.AVS_OFFICESTUDIO_FILE_OTHER_PDFA !== cmd.getOutputFormat()){
+  if(constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_PDFA !== cmd.getOutputFormat()){
     this.formatTo = cmd.getOutputFormat();
   } else {
     this.formatTo = constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_PDF;
@@ -118,11 +120,13 @@ function TaskQueueDataConvert(task) {
   this.themeDir = path.resolve(cfgPresentationThemesDir);
   this.mailMergeSend = cmd.mailmergesend;
   this.thumbnail = cmd.thumbnail;
+  this.textParams = cmd.getTextParams();
   this.jsonParams = cmd.getJsonParams();
   this.lcid = cmd.getLCID();
   this.password = cmd.getPassword();
   this.savePassword = cmd.getSavePassword();
   this.noBase64 = cmd.getNoBase64();
+  this.convertToOrigin = cmd.getConvertToOrigin();
   this.timestamp = new Date();
 }
 TaskQueueDataConvert.prototype = {
@@ -150,10 +154,14 @@ TaskQueueDataConvert.prototype = {
     if (this.thumbnail) {
       xml += this.serializeThumbnail(this.thumbnail);
     }
+    if (this.textParams) {
+      xml += this.serializeTextParams(this.textParams);
+    }
     xml += this.serializeXmlProp('m_sJsonParams', this.jsonParams);
     xml += this.serializeXmlProp('m_nLcid', this.lcid);
     xml += this.serializeXmlProp('m_oTimestamp', this.timestamp.toISOString());
     xml += this.serializeXmlProp('m_bIsNoBase64', this.noBase64);
+    xml += this.serializeXmlProp('m_sConvertToOrigin', this.convertToOrigin);
     xml += this.serializeLimit();
     xml += '</TaskQueueDataConvert>';
     fs.writeFileSync(fsPath, xml, {encoding: 'utf8'});
@@ -201,6 +209,12 @@ TaskQueueDataConvert.prototype = {
     xml += this.serializeXmlProp('width', data.getWidth());
     xml += this.serializeXmlProp('height', data.getHeight());
     xml += '</m_oThumbnail>';
+    return xml;
+  },
+  serializeTextParams: function(data) {
+    var xml = '<m_oTextParams>';
+    xml += this.serializeXmlProp('m_nTextAssociationType', data.getAssociation());
+    xml += '</m_oTextParams>';
     return xml;
   },
   serializeLimit: function() {
@@ -268,7 +282,18 @@ function getTempDir() {
   fs.mkdirSync(resultDir);
   return {temp: newTemp, source: sourceDir, result: resultDir};
 }
-function* replaceEmptyFile(docId, fileFrom, ext, _lcid) {
+function* isUselessConvertion(ctx, task, cmd) {
+  if (task.getFromChanges() && 'sfc' === cmd.getCommand()) {
+    let selectRes = yield taskResult.select(ctx, cmd.getDocId());
+    let row = selectRes.length > 0 ? selectRes[0] : null;
+    if (utils.isUselesSfc(row, cmd)) {
+      ctx.logger.warn('isUselessConvertion return true. row=%j', row);
+      return constants.CONVERT_PARAMS;
+    }
+  }
+  return constants.NO_ERROR;
+}
+function* replaceEmptyFile(ctx, fileFrom, ext, _lcid) {
   if (!fs.existsSync(fileFrom) ||  0 === fs.lstatSync(fileFrom).size) {
     let locale = 'en-US';
     if (_lcid) {
@@ -278,11 +303,11 @@ function* replaceEmptyFile(docId, fileFrom, ext, _lcid) {
         if (fs.existsSync(path.join(cfgNewFileTemplate, localeNew))) {
           locale = localeNew;
         } else {
-          logger.debug('replaceEmptyFile empty locale dir locale=%s (id=%s)', localeNew, docId);
+          ctx.logger.debug('replaceEmptyFile empty locale dir locale=%s', localeNew);
         }
       }
     }
-    logger.debug('replaceEmptyFile format=%s locale=%s (id=%s)', ext, locale, docId);
+    ctx.logger.debug('replaceEmptyFile format=%s locale=%s', ext, locale);
     let format = formatChecker.getFormatFromString(ext);
     if (formatChecker.isDocumentFormat(format)) {
       fs.copyFileSync(path.join(cfgNewFileTemplate, locale, 'new.docx'), fileFrom);
@@ -293,25 +318,26 @@ function* replaceEmptyFile(docId, fileFrom, ext, _lcid) {
     }
   }
 }
-function* downloadFile(docId, uri, fileFrom, withAuthorization, filterPrivate, opt_headers) {
+function* downloadFile(ctx, uri, fileFrom, withAuthorization, filterPrivate, opt_headers) {
   var res = constants.CONVERT_DOWNLOAD;
   var data = null;
   var downloadAttemptCount = 0;
   var urlParsed = url.parse(uri);
-  var filterStatus = yield* utils.checkHostFilter(urlParsed.hostname);
+  var filterStatus = yield* utils.checkHostFilter(ctx, urlParsed.hostname);
   if (0 == filterStatus) {
     while (constants.NO_ERROR !== res && downloadAttemptCount++ < cfgDownloadAttemptMaxCount) {
       try {
         let authorization;
-        if (utils.canIncludeOutboxAuthorization(uri) && withAuthorization) {
-          authorization = utils.fillJwtForRequest({url: uri});
+        if (utils.canIncludeOutboxAuthorization(ctx, uri) && withAuthorization) {
+          let secret = yield tenantManager.getTenantSecret(ctx, commonDefines.c_oAscSecretType.Outbox);
+          authorization = utils.fillJwtForRequest({url: uri}, secret, false);
         }
-        let getRes = yield utils.downloadUrlPromise(uri, cfgDownloadTimeout, cfgDownloadMaxBytes, authorization, filterPrivate, opt_headers);
+        let getRes = yield utils.downloadUrlPromise(ctx, uri, cfgDownloadTimeout, cfgDownloadMaxBytes, authorization, filterPrivate, opt_headers);
         data = getRes.body;
         res = constants.NO_ERROR;
       } catch (err) {
         res = constants.CONVERT_DOWNLOAD;
-        logger.error('error downloadFile:url=%s;attempt=%d;code:%s;connect:%s;(id=%s)\r\n%s', uri, downloadAttemptCount, err.code, err.connect, docId, err.stack);
+        ctx.logger.error('error downloadFile:url=%s;attempt=%d;code:%s;connect:%s %s', uri, downloadAttemptCount, err.code, err.connect, err.stack);
         //not continue attempts if timeout
         if (err.code === 'ETIMEDOUT' || err.code === 'ESOCKETTIMEDOUT') {
           break;
@@ -324,18 +350,18 @@ function* downloadFile(docId, uri, fileFrom, withAuthorization, filterPrivate, o
       }
     }
     if (constants.NO_ERROR === res) {
-      logger.debug('downloadFile complete filesize=%d (id=%s)', data.length, docId);
+      ctx.logger.debug('downloadFile complete filesize=%d', data.length);
       fs.writeFileSync(fileFrom, data);
     }
   } else {
-    logger.error('checkIpFilter error:url=%s;code:%s;(id=%s)', uri, filterStatus, docId);
+    ctx.logger.error('checkIpFilter error:url=%s;code:%s;', uri, filterStatus);
     res = constants.CONVERT_DOWNLOAD;
   }
   return res;
 }
-function* downloadFileFromStorage(id, strPath, dir) {
-  var list = yield storage.listObjects(strPath);
-  logger.debug('downloadFileFromStorage list %s (id=%s)', list.toString(), id);
+function* downloadFileFromStorage(ctx, strPath, dir, opt_specialDir) {
+  var list = yield storage.listObjects(ctx, strPath, opt_specialDir);
+  ctx.logger.debug('downloadFileFromStorage list %s', list.toString());
   //create dirs
   var dirsToCreate = [];
   var dirStruct = {};
@@ -361,36 +387,53 @@ function* downloadFileFromStorage(id, strPath, dir) {
   for (var i = 0; i < list.length; ++i) {
     var file = list[i];
     var fileRel = storage.getRelativePath(strPath, file);
-    var data = yield storage.getObject(file);
+    var data = yield storage.getObject(ctx, file, opt_specialDir);
     fs.writeFileSync(path.join(dir, fileRel), data);
   }
 }
-function* processDownloadFromStorage(dataConvert, cmd, task, tempDirs, authorProps) {
+function* processDownloadFromStorage(ctx, dataConvert, cmd, task, tempDirs, authorProps) {
   let res = constants.NO_ERROR;
   let needConcatFiles = false;
   if (task.getFromOrigin() || task.getFromSettings()) {
     dataConvert.fileFrom = path.join(tempDirs.source, 'origin.' + cmd.getFormat());
   } else {
     //перезаписываем некоторые файлы из m_sKey(например Editor.bin или changes)
-    yield* downloadFileFromStorage(cmd.getSaveKey(), cmd.getSaveKey(), tempDirs.source);
+    yield* downloadFileFromStorage(ctx, cmd.getSaveKey(), tempDirs.source);
     let format = cmd.getFormat() || 'bin';
     dataConvert.fileFrom = path.join(tempDirs.source, 'Editor.' + format);
     needConcatFiles = true;
   }
-  if (!utils.checkPathTraversal(dataConvert.key, tempDirs.source, dataConvert.fileFrom)) {
+  if (!utils.checkPathTraversal(ctx, dataConvert.key, tempDirs.source, dataConvert.fileFrom)) {
     return constants.CONVERT_PARAMS;
   }
   //mail merge
   let mailMergeSend = cmd.getMailMergeSend();
   if (mailMergeSend) {
-    yield* downloadFileFromStorage(mailMergeSend.getJsonKey(), mailMergeSend.getJsonKey(), tempDirs.source);
+    yield* downloadFileFromStorage(ctx, mailMergeSend.getJsonKey(), tempDirs.source);
     needConcatFiles = true;
   }
   if (needConcatFiles) {
     yield* concatFiles(tempDirs.source);
   }
   if (task.getFromChanges()) {
-    res = yield* processChanges(tempDirs, cmd, authorProps);
+    if(cfgEditor['binaryChanges']) {
+      res = yield* processChangesBin(ctx, tempDirs, task, cmd, authorProps);
+    } else {
+      res = yield* processChangesBase64(ctx, tempDirs, task, cmd, authorProps);
+    }
+  }
+  //todo rework
+  if (!fs.existsSync(dataConvert.fileFrom)) {
+    if (fs.existsSync(path.join(tempDirs.source, 'origin.docx'))) {
+      dataConvert.fileFrom = path.join(tempDirs.source, 'origin.docx');
+    } else if (fs.existsSync(path.join(tempDirs.source, 'origin.xlsx'))) {
+      dataConvert.fileFrom = path.join(tempDirs.source, 'origin.xlsx');
+    } else if (fs.existsSync(path.join(tempDirs.source, 'origin.pptx'))) {
+      dataConvert.fileFrom = path.join(tempDirs.source, 'origin.pptx');
+    }
+    let fileFromNew = path.join(path.dirname(dataConvert.fileFrom), "Editor.bin");
+    fs.renameSync(dataConvert.fileFrom, fileFromNew);
+    dataConvert.fileFrom = fileFromNew;
   }
   return res;
 }
@@ -419,13 +462,131 @@ function* concatFiles(source) {
     }
   }
 }
-
-function* processChanges(tempDirs, cmd, authorProps) {
+function* processChangesBin(ctx, tempDirs, task, cmd, authorProps) {
   let res = constants.NO_ERROR;
   let changesDir = path.join(tempDirs.source, constants.CHANGES_NAME);
   fs.mkdirSync(changesDir);
   let indexFile = 0;
   let changesAuthor = null;
+  let changesAuthorUnique = null;
+  let changesIndex = null;
+  let changesHistory = {
+    serverVersion: commonDefines.buildVersion,
+    changes: []
+  };
+  let forceSave = cmd.getForceSave();
+  let forceSaveTime;
+  let forceSaveIndex = Number.MAX_VALUE;
+  if (forceSave && undefined !== forceSave.getTime() && undefined !== forceSave.getIndex()) {
+    forceSaveTime = forceSave.getTime();
+    forceSaveIndex = forceSave.getIndex();
+  }
+  let extChangeInfo = cmd.getExternalChangeInfo();
+  let extChanges;
+  if (extChangeInfo) {
+    extChanges = [{
+      id: cmd.getDocId(), change_id: 0, change_data: Buffer.alloc(0), user_id: extChangeInfo.user_id,
+      user_id_original: extChangeInfo.user_id_original, user_name: extChangeInfo.user_name,
+      change_date: new Date(extChangeInfo.change_date)
+    }];
+  }
+
+  let streamObj = yield* streamCreateBin(ctx, changesDir, indexFile++, {highWaterMark: cfgStreamWriterBufferSize});
+  yield* streamWriteBin(streamObj, Buffer.from(utils.getChangesFileHeader(), 'utf-8'));
+  let curIndexStart = 0;
+  let curIndexEnd = Math.min(curIndexStart + cfgMaxRequestChanges, forceSaveIndex);
+  while (curIndexStart < curIndexEnd || extChanges) {
+    let changes = [];
+    if (curIndexStart < curIndexEnd) {
+      changes = yield baseConnector.getChangesPromise(ctx, cmd.getDocId(), curIndexStart, curIndexEnd, forceSaveTime);
+      if (changes.length > 0 && changes[0].change_data.subarray(0, 'ENCRYPTED;'.length).includes('ENCRYPTED;')) {
+        ctx.logger.warn('processChanges encrypted changes');
+        //todo sql request instead?
+        res = constants.EDITOR_CHANGES;
+      }
+      res = yield* isUselessConvertion(ctx, task, cmd);
+      if (constants.NO_ERROR !== res) {
+        break;
+      }
+    }
+    if (0 === changes.length && extChanges) {
+      changes = extChanges;
+    }
+    extChanges = undefined;
+    for (let i = 0; i < changes.length; ++i) {
+      let change = changes[i];
+      if (null === changesAuthor || changesAuthor !== change.user_id_original) {
+        if (null !== changesAuthor) {
+          yield* streamEndBin(streamObj);
+          streamObj = yield* streamCreateBin(ctx, changesDir, indexFile++);
+          yield* streamWriteBin(streamObj, Buffer.from(utils.getChangesFileHeader(), 'utf-8'));
+        }
+        let strDate = baseConnector.getDateTime(change.change_date);
+        changesHistory.changes.push({'created': strDate, 'user': {'id': change.user_id_original, 'name': change.user_name}});
+      }
+      changesAuthor = change.user_id_original;
+      changesAuthorUnique = change.user_id;
+      yield* streamWriteBin(streamObj, change.change_data);
+      streamObj.isNoChangesInFile = false;
+    }
+    if (changes.length > 0) {
+      authorProps.lastModifiedBy = changes[changes.length - 1].user_name;
+      authorProps.modified = changes[changes.length - 1].change_date.toISOString().slice(0, 19) + 'Z';
+    }
+    if (changes.length === curIndexEnd - curIndexStart) {
+      curIndexStart += cfgMaxRequestChanges;
+      curIndexEnd = Math.min(curIndexStart + cfgMaxRequestChanges, forceSaveIndex);
+    } else {
+      break;
+    }
+  }
+  yield* streamEndBin(streamObj);
+  if (streamObj.isNoChangesInFile) {
+    fs.unlinkSync(streamObj.filePath);
+  }
+  if (null !== changesAuthorUnique) {
+    changesIndex = utils.getIndexFromUserId(changesAuthorUnique, changesAuthor);
+  }
+  if (null == changesAuthor && null == changesIndex && forceSave && undefined !== forceSave.getAuthorUserId() &&
+    undefined !== forceSave.getAuthorUserIndex()) {
+    changesAuthor = forceSave.getAuthorUserId();
+    changesIndex = forceSave.getAuthorUserIndex();
+  }
+  cmd.setUserId(changesAuthor);
+  cmd.setUserIndex(changesIndex);
+  fs.writeFileSync(path.join(tempDirs.result, 'changesHistory.json'), JSON.stringify(changesHistory), 'utf8');
+  ctx.logger.debug('processChanges end');
+  return res;
+}
+
+function* streamCreateBin(ctx, changesDir, indexFile, opt_options) {
+  let fileName = constants.CHANGES_NAME + indexFile + '.bin';
+  let filePath = path.join(changesDir, fileName);
+  let writeStream = yield utils.promiseCreateWriteStream(filePath, opt_options);
+  writeStream.on('error', function(err) {
+    //todo integrate error handle in main thread (probable: set flag here and check it in main thread)
+    ctx.logger.error('WriteStreamError %s', err.stack);
+  });
+  return {writeStream: writeStream, filePath: filePath, isNoChangesInFile: true};
+}
+
+function* streamWriteBin(streamObj, buf) {
+  if (!streamObj.writeStream.write(buf)) {
+    yield utils.promiseWaitDrain(streamObj.writeStream);
+  }
+}
+
+function* streamEndBin(streamObj) {
+  streamObj.writeStream.end();
+  yield utils.promiseWaitClose(streamObj.writeStream);
+}
+function* processChangesBase64(ctx, tempDirs, task, cmd, authorProps) {
+  let res = constants.NO_ERROR;
+  let changesDir = path.join(tempDirs.source, constants.CHANGES_NAME);
+  fs.mkdirSync(changesDir);
+  let indexFile = 0;
+  let changesAuthor = null;
+  let changesAuthorUnique = null;
   let changesIndex = null;
   let changesHistory = {
     serverVersion: commonDefines.buildVersion,
@@ -448,13 +609,22 @@ function* processChanges(tempDirs, cmd, authorProps) {
     }];
   }
 
-  let streamObj = yield* streamCreate(cmd.getDocId(), changesDir, indexFile++, {highWaterMark: cfgStreamWriterBufferSize});
+  let streamObj = yield* streamCreate(ctx, changesDir, indexFile++, {highWaterMark: cfgStreamWriterBufferSize});
   let curIndexStart = 0;
   let curIndexEnd = Math.min(curIndexStart + cfgMaxRequestChanges, forceSaveIndex);
   while (curIndexStart < curIndexEnd || extChanges) {
     let changes = [];
     if (curIndexStart < curIndexEnd) {
-      changes = yield baseConnector.getChangesPromise(cmd.getDocId(), curIndexStart, curIndexEnd, forceSaveTime);
+      changes = yield baseConnector.getChangesPromise(ctx, cmd.getDocId(), curIndexStart, curIndexEnd, forceSaveTime);
+      if (changes.length > 0 && changes[0].change_data.startsWith('ENCRYPTED;')) {
+        ctx.logger.warn('processChanges encrypted changes');
+        //todo sql request instead?
+        res = constants.EDITOR_CHANGES;
+      }
+      res = yield* isUselessConvertion(ctx, task, cmd);
+      if (constants.NO_ERROR !== res) {
+        break;
+      }
     }
     if (0 === changes.length && extChanges) {
       changes = extChanges;
@@ -462,26 +632,19 @@ function* processChanges(tempDirs, cmd, authorProps) {
     extChanges = undefined;
     for (let i = 0; i < changes.length; ++i) {
       let change = changes[i];
-      if (change.change_data.startsWith('ENCRYPTED;')) {
-        logger.warn('processChanges encrypted changes (id=%s)', cmd.getDocId());
-        //todo sql request instead?
-        res = constants.EDITOR_CHANGES;
-        break;
-      }
       if (null === changesAuthor || changesAuthor !== change.user_id_original) {
         if (null !== changesAuthor) {
           yield* streamEnd(streamObj, ']');
-          streamObj = yield* streamCreate(cmd.getDocId(), changesDir, indexFile++);
+          streamObj = yield* streamCreate(ctx, changesDir, indexFile++);
         }
-        changesAuthor = change.user_id_original;
-        changesIndex = utils.getIndexFromUserId(change.user_id, change.user_id_original);
-
         let strDate = baseConnector.getDateTime(change.change_date);
-        changesHistory.changes.push({'created': strDate, 'user': {'id': changesAuthor, 'name': change.user_name}});
+        changesHistory.changes.push({'created': strDate, 'user': {'id': change.user_id_original, 'name': change.user_name}});
         yield* streamWrite(streamObj, '[');
       } else {
         yield* streamWrite(streamObj, ',');
       }
+      changesAuthor = change.user_id_original;
+      changesAuthorUnique = change.user_id;
       yield* streamWrite(streamObj, change.change_data);
       streamObj.isNoChangesInFile = false;
     }
@@ -500,6 +663,9 @@ function* processChanges(tempDirs, cmd, authorProps) {
   if (streamObj.isNoChangesInFile) {
     fs.unlinkSync(streamObj.filePath);
   }
+  if (null !== changesAuthorUnique) {
+    changesIndex = utils.getIndexFromUserId(changesAuthorUnique, changesAuthor);
+  }
   if (null == changesAuthor && null == changesIndex && forceSave && undefined !== forceSave.getAuthorUserId() &&
     undefined !== forceSave.getAuthorUserIndex()) {
     changesAuthor = forceSave.getAuthorUserId();
@@ -508,16 +674,17 @@ function* processChanges(tempDirs, cmd, authorProps) {
   cmd.setUserId(changesAuthor);
   cmd.setUserIndex(changesIndex);
   fs.writeFileSync(path.join(tempDirs.result, 'changesHistory.json'), JSON.stringify(changesHistory), 'utf8');
+  ctx.logger.debug('processChanges end');
   return res;
 }
 
-function* streamCreate(docId, changesDir, indexFile, opt_options) {
+function* streamCreate(ctx, changesDir, indexFile, opt_options) {
   let fileName = constants.CHANGES_NAME + indexFile + '.json';
   let filePath = path.join(changesDir, fileName);
   let writeStream = yield utils.promiseCreateWriteStream(filePath, opt_options);
   writeStream.on('error', function(err) {
     //todo integrate error handle in main thread (probable: set flag here and check it in main thread)
-    logger.error('WriteStreamError (id=%s)\r\n%s', docId, err.stack);
+    ctx.logger.error('WriteStreamError %s', err.stack);
   });
   return {writeStream: writeStream, filePath: filePath, isNoChangesInFile: true};
 }
@@ -532,41 +699,41 @@ function* streamEnd(streamObj, text) {
   streamObj.writeStream.end(text, 'utf8');
   yield utils.promiseWaitClose(streamObj.writeStream);
 }
-function* processUploadToStorage(dir, storagePath) {
+function* processUploadToStorage(ctx, dir, storagePath, opt_specialDirDst) {
   var list = yield utils.listObjects(dir);
   if (list.length < MAX_OPEN_FILES) {
-    yield* processUploadToStorageChunk(list, dir, storagePath);
+    yield* processUploadToStorageChunk(ctx, list, dir, storagePath, opt_specialDirDst);
   } else {
     for (var i = 0, j = list.length; i < j; i += MAX_OPEN_FILES) {
-      yield* processUploadToStorageChunk(list.slice(i, i + MAX_OPEN_FILES), dir, storagePath);
+      yield* processUploadToStorageChunk(ctx, list.slice(i, i + MAX_OPEN_FILES), dir, storagePath, opt_specialDirDst);
     }
   }
 }
-function* processUploadToStorageChunk(list, dir, storagePath) {
+function* processUploadToStorageChunk(ctx, list, dir, storagePath, opt_specialDirDst) {
   yield Promise.all(list.map(function (curValue) {
     let localValue = storagePath + '/' + curValue.substring(dir.length + 1);
-    return storage.uploadObject(localValue, curValue);
+    return storage.uploadObject(ctx, localValue, curValue, opt_specialDirDst);
   }));
 }
-function writeProcessOutputToLog(docId, childRes, isDebug) {
+function writeProcessOutputToLog(ctx, childRes, isDebug) {
   if (childRes) {
     if (undefined !== childRes.stdout) {
       if (isDebug) {
-        logger.debug('stdout (id=%s):%s', docId, childRes.stdout);
+        ctx.logger.debug('stdout:%s', childRes.stdout);
       } else {
-        logger.error('stdout (id=%s):%s', docId, childRes.stdout);
+        ctx.logger.error('stdout:%s', childRes.stdout);
       }
     }
     if (undefined !== childRes.stderr) {
       if (isDebug) {
-        logger.debug('stderr (id=%s):%s', docId, childRes.stderr);
+        ctx.logger.debug('stderr:%s', childRes.stderr);
       } else {
-        logger.error('stderr (id=%s):%s', docId, childRes.stderr);
+        ctx.logger.error('stderr:%s', childRes.stderr);
       }
     }
   }
 }
-function* postProcess(cmd, dataConvert, tempDirs, childRes, error, isTimeout) {
+function* postProcess(ctx, cmd, dataConvert, tempDirs, childRes, error, isTimeout) {
   var exitCode = 0;
   var exitSignal = null;
   if(childRes) {
@@ -582,23 +749,23 @@ function* postProcess(cmd, dataConvert, tempDirs, childRes, error, isTimeout) {
       error = constants.CONVERT;
     }
     if (-1 !== exitCodesMinorError.indexOf(error)) {
-      writeProcessOutputToLog(dataConvert.key, childRes, true);
-      logger.debug('ExitCode (code=%d;signal=%s;error:%d;id=%s)', exitCode, exitSignal, error, dataConvert.key);
+      writeProcessOutputToLog(ctx, childRes, true);
+      ctx.logger.debug('ExitCode (code=%d;signal=%s;error:%d)', exitCode, exitSignal, error);
     } else {
-      writeProcessOutputToLog(dataConvert.key, childRes, false);
-      logger.error('ExitCode (code=%d;signal=%s;error:%d;id=%s)', exitCode, exitSignal, error, dataConvert.key);
+      writeProcessOutputToLog(ctx, childRes, false);
+      ctx.logger.error('ExitCode (code=%d;signal=%s;error:%d)', exitCode, exitSignal, error);
       if (cfgErrorFiles) {
-        yield* processUploadToStorage(tempDirs.temp, cfgErrorFiles + '/' + dataConvert.key);
-        logger.debug('processUploadToStorage error complete(id=%s)', dataConvert.key);
+        yield* processUploadToStorage(ctx, tempDirs.temp, dataConvert.key, cfgErrorFiles);
+        ctx.logger.debug('processUploadToStorage error complete(id=%s)', dataConvert.key);
       }
     }
   } else {
-    writeProcessOutputToLog(dataConvert.key, childRes, true);
-    logger.debug('ExitCode (code=%d;signal=%s;error:%d;id=%s)', exitCode, exitSignal, error, dataConvert.key);
+    writeProcessOutputToLog(ctx, childRes, true);
+    ctx.logger.debug('ExitCode (code=%d;signal=%s;error:%d)', exitCode, exitSignal, error);
   }
   if (-1 !== exitCodesUpload.indexOf(error)) {
-    yield* processUploadToStorage(tempDirs.result, dataConvert.key);
-    logger.debug('processUploadToStorage complete(id=%s)', dataConvert.key);
+    yield* processUploadToStorage(ctx, tempDirs.result, dataConvert.key);
+    ctx.logger.debug('processUploadToStorage complete');
   }
   cmd.setStatusInfo(error);
   var existFile = false;
@@ -625,27 +792,77 @@ function* postProcess(cmd, dataConvert, tempDirs, childRes, error, isTimeout) {
     cmd.setTitle(cmd.getOutputPath());
   }
 
-  var res = new commonDefines.TaskQueueData();
-  res.setCmd(cmd);
-  logger.debug('output (data=%s;id=%s)', JSON.stringify(res), dataConvert.key);
-  return res;
-}
-function deleteFolderRecursive(strPath) {
-  if (fs.existsSync(strPath)) {
-    var files = fs.readdirSync(strPath);
-    files.forEach(function(file) {
-      var curPath = path.join(strPath, file);
-      if (fs.lstatSync(curPath).isDirectory()) { // recurse
-        deleteFolderRecursive(curPath);
-      } else { // delete file
-        fs.unlinkSync(curPath);
-      }
-    });
-    fs.rmdirSync(strPath);
-  }
+  var queueData = new commonDefines.TaskQueueData();
+  queueData.setCtx(ctx);
+  queueData.setCmd(cmd);
+  ctx.logger.debug('output (data=%j)', queueData);
+  return queueData;
 }
 
-function* ExecuteTask(task) {
+function* spawnProcess(ctx, isBuilder, tempDirs, dataConvert, authorProps, getTaskTime, task) {
+  let childRes, isTimeout = false;
+  let childArgs;
+  if (cfgArgs.length > 0) {
+    childArgs = cfgArgs.trim().replace(/  +/g, ' ').split(' ');
+  } else {
+    childArgs = [];
+  }
+  let processPath;
+  if (!isBuilder) {
+    processPath = cfgX2tPath;
+    let paramsFile = path.join(tempDirs.temp, 'params.xml');
+    dataConvert.serialize(paramsFile);
+    childArgs.push(paramsFile);
+    let hiddenXml = yield dataConvert.serializeHidden();
+    if (hiddenXml) {
+      childArgs.push(hiddenXml);
+    }
+  } else {
+    fs.mkdirSync(path.join(tempDirs.result, 'output'));
+    processPath = cfgDocbuilderPath;
+    childArgs.push('--check-fonts=0');
+    childArgs.push('--save-use-only-names=' + tempDirs.result + '/output');
+    childArgs.push(dataConvert.fileFrom);
+  }
+  let timeoutId;
+  try {
+    let spawnOptions = cfgSpawnOptions;
+    if (authorProps.lastModifiedBy && authorProps.modified) {
+      //copy to avoid modification of global cfgSpawnOptions
+      spawnOptions = Object.assign({}, cfgSpawnOptions);
+      spawnOptions.env = Object.assign({}, spawnOptions.env || process.env);
+
+      spawnOptions.env['LAST_MODIFIED_BY'] = authorProps.lastModifiedBy;
+      spawnOptions.env['MODIFIED'] = authorProps.modified;
+    }
+    let spawnAsyncPromise = spawnAsync(processPath, childArgs, spawnOptions);
+    childRes = spawnAsyncPromise.child;
+    let waitMS = task.getVisibilityTimeout() * 1000 - (new Date().getTime() - getTaskTime.getTime());
+    timeoutId = setTimeout(function() {
+      isTimeout = true;
+      timeoutId = undefined;
+      //close stdio streams to enable emit 'close' event even if HtmlFileInternal is hung-up
+      childRes.stdin.end();
+      childRes.stdout.destroy();
+      childRes.stderr.destroy();
+      childRes.kill();
+    }, waitMS);
+    childRes = yield spawnAsyncPromise;
+  } catch (err) {
+    if (null === err.status) {
+      ctx.logger.error('error spawnAsync %s', err.stack);
+    } else {
+      ctx.logger.debug('error spawnAsync %s', err.stack);
+    }
+    childRes = err;
+  }
+  if (undefined !== timeoutId) {
+    clearTimeout(timeoutId);
+  }
+  return {childRes: childRes, isTimeout: isTimeout};
+}
+
+function* ExecuteTask(ctx, task) {
   var startDate = null;
   var curDate = null;
   if(clientStatsD) {
@@ -656,17 +873,20 @@ function* ExecuteTask(task) {
   var getTaskTime = new Date();
   var cmd = task.getCmd();
   var dataConvert = new TaskQueueDataConvert(task);
-  logger.debug('Start Task(id=%s)', dataConvert.key);
+  ctx.logger.info('Start Task');
   var error = constants.NO_ERROR;
   tempDirs = getTempDir();
   let fileTo = task.getToFile();
   dataConvert.fileTo = fileTo ? path.join(tempDirs.result, fileTo) : '';
   let isBuilder = cmd.getIsBuilder();
   let authorProps = {lastModifiedBy: null, modified: null};
-  if (cmd.getUrl()) {
+  error = yield* isUselessConvertion(ctx, task, cmd);
+  if (constants.NO_ERROR !== error) {
+    ;
+  } else if (cmd.getUrl()) {
     let format = cmd.getFormat();
     dataConvert.fileFrom = path.join(tempDirs.source, dataConvert.key + '.' + format);
-    if (utils.checkPathTraversal(dataConvert.key, tempDirs.source, dataConvert.fileFrom)) {
+    if (utils.checkPathTraversal(ctx, dataConvert.key, tempDirs.source, dataConvert.fileFrom)) {
       let url = cmd.getUrl();
       let withAuthorization = cmd.getWithAuthorization();
       let filterPrivate = !withAuthorization;
@@ -676,25 +896,26 @@ function* ExecuteTask(task) {
       if (wopiParams) {
         withAuthorization = false;
         filterPrivate = false;
-        let fileInfo = wopiParams.commonInfo.fileInfo;
+        let fileInfo = wopiParams.commonInfo?.fileInfo;
         let userAuth = wopiParams.userAuth;
-        fileSize = fileInfo.Size;
-        if (fileInfo.FileUrl) {
+        fileSize = fileInfo?.Size;
+        if (fileInfo?.FileUrl) {
+          //Requests to the FileUrl can not be signed using proof keys. The FileUrl is used exactly as provided by the host, so it does not necessarily include the access token, which is required to construct the expected proof.
           url = fileInfo.FileUrl;
-        } else if (fileInfo.TemplateSource) {
+        } else if (fileInfo?.TemplateSource) {
           url = fileInfo.TemplateSource;
         } else if (userAuth) {
           url = `${userAuth.wopiSrc}/contents?access_token=${userAuth.access_token}`;
-          headers = {'X-WOPI-MaxExpectedSize': cfgDownloadMaxBytes, 'X-WOPI-ItemVersion': fileInfo.Version};
+          headers = {'X-WOPI-MaxExpectedSize': cfgDownloadMaxBytes};
           wopiClient.fillStandardHeaders(headers, url, userAuth.access_token);
         }
-        logger.debug('wopi url=%s; headers=%j(id=%s)', url, headers, dataConvert.key);
+        ctx.logger.debug('wopi url=%s; headers=%j', url, headers);
       }
       if (undefined === fileSize || fileSize > 0) {
-        error = yield* downloadFile(dataConvert.key, url, dataConvert.fileFrom, withAuthorization, filterPrivate, headers);
+        error = yield* downloadFile(ctx, url, dataConvert.fileFrom, withAuthorization, filterPrivate, headers);
       }
       if (constants.NO_ERROR === error) {
-        yield* replaceEmptyFile(dataConvert.key, dataConvert.fileFrom, format, cmd.getLCID());
+        yield* replaceEmptyFile(ctx, dataConvert.fileFrom, format, cmd.getLCID());
       }
       if(clientStatsD) {
         clientStatsD.timing('conv.downloadFile', new Date() - curDate);
@@ -704,16 +925,16 @@ function* ExecuteTask(task) {
       error = constants.CONVERT_PARAMS;
     }
   } else if (cmd.getSaveKey()) {
-    yield* downloadFileFromStorage(cmd.getDocId(), cmd.getDocId(), tempDirs.source);
-    logger.debug('downloadFileFromStorage complete(id=%s)', dataConvert.key);
+    yield* downloadFileFromStorage(ctx, cmd.getDocId(), tempDirs.source);
+    ctx.logger.debug('downloadFileFromStorage complete');
     if(clientStatsD) {
       clientStatsD.timing('conv.downloadFileFromStorage', new Date() - curDate);
       curDate = new Date();
     }
-    error = yield* processDownloadFromStorage(dataConvert, cmd, task, tempDirs, authorProps);
+    error = yield* processDownloadFromStorage(ctx, dataConvert, cmd, task, tempDirs, authorProps);
   } else if (cmd.getForgotten()) {
-    yield* downloadFileFromStorage(cmd.getDocId(), cmd.getForgotten(), tempDirs.source);
-    logger.debug('downloadFileFromStorage complete(id=%s)', dataConvert.key);
+    yield* downloadFileFromStorage(ctx, cmd.getForgotten(), tempDirs.source, cfgForgottenFiles);
+    ctx.logger.debug('downloadFileFromStorage complete');
     let list = yield utils.listObjects(tempDirs.source, false);
     if (list.length > 0) {
       dataConvert.fileFrom = list[0];
@@ -725,8 +946,8 @@ function* ExecuteTask(task) {
     }
   } else if (isBuilder) {
     //in cause script in POST body
-    yield* downloadFileFromStorage(cmd.getDocId(), cmd.getDocId(), tempDirs.source);
-    logger.debug('downloadFileFromStorage complete(id=%s)', dataConvert.key);
+    yield* downloadFileFromStorage(ctx, cmd.getDocId(), tempDirs.source);
+    ctx.logger.debug('downloadFileFromStorage complete');
     let list = yield utils.listObjects(tempDirs.source, false);
     if (list.length > 0) {
       dataConvert.fileFrom = list[0];
@@ -734,86 +955,34 @@ function* ExecuteTask(task) {
   } else {
     error = constants.UNKNOWN;
   }
-  var childRes = null;
+  let childRes = null;
   let isTimeout = false;
   if (constants.NO_ERROR === error) {
-    if(constants.AVS_OFFICESTUDIO_FILE_OTHER_HTMLZIP === dataConvert.formatTo && cmd.getSaveKey() && !dataConvert.mailMergeSend) {
-      //todo заглушка.вся конвертация на клиенте, но нет простого механизма сохранения на клиенте
-      yield utils.pipeFiles(dataConvert.fileFrom, dataConvert.fileTo);
-    } else {
-      var childArgs;
-      if (cfgArgs.length > 0) {
-        childArgs = cfgArgs.trim().replace(/  +/g, ' ').split(' ');
-      } else {
-        childArgs = [];
-      }
-      let processPath;
-      if (!isBuilder) {
-        processPath = cfgX2tPath;
-        let paramsFile = path.join(tempDirs.temp, 'params.xml');
-        dataConvert.serialize(paramsFile);
-        childArgs.push(paramsFile);
-        let hiddenXml = yield dataConvert.serializeHidden();
-        if (hiddenXml) {
-          childArgs.push(hiddenXml);
-        }
-      } else {
-        fs.mkdirSync(path.join(tempDirs.result, 'output'));
-        processPath = cfgDocbuilderPath;
-        childArgs.push('--all-fonts-path=' + cfgDocbuilderAllFontsPath);
-        if (cfgDocbuilderCoreFontsPath) {
-          childArgs.push('--fonts-dir=' + cfgDocbuilderCoreFontsPath);
-        }
-        childArgs.push('--save-use-only-names=' + tempDirs.result + '/output');
-        childArgs.push(dataConvert.fileFrom);
-      }
-      let timeoutId;
-      try {
-        let spawnOptions = cfgSpawnOptions;
-        if (authorProps.lastModifiedBy && authorProps.modified) {
-          //copy to avoid modification of global cfgSpawnOptions
-          spawnOptions = Object.assign({}, cfgSpawnOptions);
-          spawnOptions.env = Object.assign({}, spawnOptions.env || process.env);
-
-          spawnOptions.env['LAST_MODIFIED_BY'] = authorProps.lastModifiedBy;
-          spawnOptions.env['MODIFIED'] = authorProps.modified;
-        }
-        let spawnAsyncPromise = spawnAsync(processPath, childArgs, spawnOptions);
-        childRes = spawnAsyncPromise.child;
-        let waitMS = task.getVisibilityTimeout() * 1000 - (new Date().getTime() - getTaskTime.getTime());
-        timeoutId = setTimeout(function() {
-          isTimeout = true;
-          timeoutId = undefined;
-          //close stdio streams to enable emit 'close' event even if HtmlFileInternal is hung-up
-          childRes.stdin.end();
-          childRes.stdout.destroy();
-          childRes.stderr.destroy();
-          childRes.kill();
-        }, waitMS);
-        childRes = yield spawnAsyncPromise;
-      } catch (err) {
-        let fLog = null === err.status ? logger.error : logger.debug;
-        fLog.call(logger, 'error spawnAsync(id=%s)\r\n%s', cmd.getDocId(), err.stack);
-        childRes = err;
-      }
-      if (undefined !== timeoutId) {
-        clearTimeout(timeoutId);
-      }
+    ({childRes, isTimeout} = yield* spawnProcess(ctx, isBuilder, tempDirs, dataConvert, authorProps, getTaskTime, task));
+    if (childRes && 0 !== childRes.status && !isTimeout && task.getFromChanges()
+      && constants.AVS_OFFICESTUDIO_FILE_OTHER_OOXML !== dataConvert.formatTo
+      && !formatChecker.isOOXFormat(dataConvert.formatTo) && !cmd.getWopiParams()) {
+      ctx.logger.warn('rollback to save changes to ooxml. See assemblyFormatAsOrigin param. formatTo=%s', formatChecker.getStringFromFormat(dataConvert.formatTo));
+      let extOld = path.extname(dataConvert.fileTo);
+      let extNew = '.' + formatChecker.getStringFromFormat(constants.AVS_OFFICESTUDIO_FILE_OTHER_OOXML);
+      dataConvert.formatTo = constants.AVS_OFFICESTUDIO_FILE_OTHER_OOXML;
+      dataConvert.fileTo = dataConvert.fileTo.slice(0, -extOld.length) + extNew;
+      ({childRes, isTimeout} = yield* spawnProcess(ctx, isBuilder, tempDirs, dataConvert, authorProps, getTaskTime, task));
     }
     if(clientStatsD) {
       clientStatsD.timing('conv.spawnSync', new Date() - curDate);
       curDate = new Date();
     }
   }
-  resData = yield* postProcess(cmd, dataConvert, tempDirs, childRes, error, isTimeout);
-  logger.debug('postProcess (id=%s)', dataConvert.key);
+  resData = yield* postProcess(ctx, cmd, dataConvert, tempDirs, childRes, error, isTimeout);
+  ctx.logger.debug('postProcess');
   if(clientStatsD) {
     clientStatsD.timing('conv.postProcess', new Date() - curDate);
     curDate = new Date();
   }
   if (tempDirs) {
-    deleteFolderRecursive(tempDirs.temp);
-    logger.debug('deleteFolderRecursive (id=%s)', dataConvert.key);
+    fs.rmSync(tempDirs.temp, { recursive: true, force: true });
+    ctx.logger.debug('deleteFolderRecursive');
     if(clientStatsD) {
       clientStatsD.timing('conv.deleteFolderRecursive', new Date() - curDate);
       curDate = new Date();
@@ -822,55 +991,88 @@ function* ExecuteTask(task) {
   if(clientStatsD) {
     clientStatsD.timing('conv.allconvert', new Date() - startDate);
   }
+  ctx.logger.info('End Task');
   return resData;
 }
-
+function ackTask(ctx, res, task, ack) {
+  return co(function*() {
+    try {
+      if (!res) {
+        res = createErrorResponse(ctx, task);
+      }
+      if (res) {
+        yield queue.addResponse(res);
+        ctx.logger.info('ackTask addResponse');
+      }
+    } catch (err) {
+      ctx.logger.error('ackTask %s', err.stack);
+    } finally {
+      ack();
+      ctx.logger.info('ackTask ack');
+    }
+  });
+}
+function receiveTaskSetTimeout(ctx, task, ack, outParams) {
+  let delay = 1.1 * task.getVisibilityTimeout() * 1000;
+  return setTimeout(function() {
+    return co(function*() {
+      outParams.isAck = true;
+      ctx.logger.error('receiveTask timeout %d', delay);
+      yield ackTask(ctx, null, task, ack);
+      yield queue.closeOrWait();
+      process.exit(1);
+    });
+  }, delay);
+}
 function receiveTask(data, ack) {
   return co(function* () {
     var res = null;
     var task = null;
+    let outParams = {isAck: false};
+    let timeoutId = undefined;
+    let ctx = new operationContext.Context();
     try {
       task = new commonDefines.TaskQueueData(JSON.parse(data));
       if (task) {
-        res = yield* ExecuteTask(task);
+        ctx.initFromTaskQueueData(task);
+        timeoutId = receiveTaskSetTimeout(ctx, task, ack, outParams);
+        res = yield* ExecuteTask(ctx, task);
       }
     } catch (err) {
-      logger.error(err);
+      ctx.logger.error(err);
     } finally {
-      try {
-        if (!res && task) {
-          //если все упало так что даже нет res, все равно пытаемся отдать ошибку.
-          var cmd = task.getCmd();
-          cmd.setStatusInfo(constants.CONVERT);
-          res = new commonDefines.TaskQueueData();
-          res.setCmd(cmd);
-        }
-        if (res) {
-          yield queue.addResponse(res);
-        }
-      } catch (err) {
-        logger.error(err);
-      } finally {
-        ack();
+      clearTimeout(timeoutId);
+      if (!outParams.isAck) {
+        yield ackTask(ctx, res, task, ack);
       }
     }
   });
 }
-function simulateErrorResponse(data){
-  let task = new commonDefines.TaskQueueData(JSON.parse(data));
+function createErrorResponse(ctx, task){
+  if (!task) {
+    return null;
+  }
+  ctx.logger.debug('createErrorResponse');
   //simulate error response
   let cmd = task.getCmd();
   cmd.setStatusInfo(constants.CONVERT);
   let res = new commonDefines.TaskQueueData();
+  res.setCtx(ctx);
   res.setCmd(cmd);
   return res;
+}
+function simulateErrorResponse(data){
+  let task = new commonDefines.TaskQueueData(JSON.parse(data));
+  let ctx = new operationContext.Context();
+  ctx.initFromTaskQueueData(task);
+  return createErrorResponse(ctx, task);
 }
 function run() {
   queue = new queueService(simulateErrorResponse);
   queue.on('task', receiveTask);
   queue.init(true, true, true, false, false, false, function(err) {
     if (null != err) {
-      logger.error('createTaskQueue error :\r\n%s', err.stack);
+      operationContext.global.logger.error('createTaskQueue error: %s', err.stack);
     }
   });
 }

@@ -34,7 +34,6 @@
 
 var path = require('path');
 var constants = require('./constants');
-var logger = require('./logger');
 
 function getImageFormatBySignature(buffer) {
   var length = buffer.length;
@@ -273,6 +272,8 @@ exports.getFormatFromString = function(ext) {
       return constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLTX;
     case 'xltm':
       return constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLTM;
+    case 'xltb':
+      return constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLSB;
     case 'fods':
       return constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_ODS_FLAT;
     case 'ots':
@@ -311,7 +312,7 @@ exports.getFormatFromString = function(ext) {
     case 'pdf':
       return constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_PDF;
     case 'pdfa':
-      return constants.AVS_OFFICESTUDIO_FILE_OTHER_PDFA;
+      return constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_PDFA;
     case 'swf':
       return constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_SWF;
     case 'djvu':
@@ -401,6 +402,8 @@ exports.getStringFromFormat = function(format) {
       return 'fodp';
     case constants.AVS_OFFICESTUDIO_FILE_PRESENTATION_OTP:
       return 'otp';
+    case constants.AVS_OFFICESTUDIO_FILE_PRESENTATION_PPTX_PACKAGE:
+      return 'xml';
 
     case constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLSX:
       return 'xlsx';
@@ -416,13 +419,19 @@ exports.getStringFromFormat = function(format) {
       return 'xltx';
     case constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLTM:
       return 'xltm';
+    case constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLSB:
+      return 'xlsb';
     case constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_ODS_FLAT:
       return 'fods';
     case constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_OTS:
       return 'ots';
+    case constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLSX_FLAT:
+      return 'xlsx';
+    case constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLSX_PACKAGE:
+      return 'xml';
 
     case constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_PDF:
-    case constants.AVS_OFFICESTUDIO_FILE_OTHER_PDFA:
+    case constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_PDFA:
       return 'pdf';
     case constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_SWF:
       return 'swf';
@@ -490,7 +499,7 @@ exports.getStringFromFormat = function(format) {
       return '';
   }
 };
-exports.getImageFormat = function(buffer, optExt) {
+exports.getImageFormat = function(ctx, buffer, optExt) {
   var format = constants.AVS_OFFICESTUDIO_FILE_UNKNOWN;
   try {
     //signature
@@ -509,8 +518,7 @@ exports.getImageFormat = function(buffer, optExt) {
     }
   }
   catch (e) {
-    logger.error(optExt);
-    logger.error('error getImageFormat:\r\n%s', e.stack);
+    ctx.logger.error('error getImageFormat ext=%s: %s', optExt, e.stack);
   }
   return format;
 };
@@ -528,4 +536,22 @@ exports.isPresentationFormat = function(format) {
   return 0 !== (format & constants.AVS_OFFICESTUDIO_FILE_PRESENTATION) ||
     format === constants.AVS_OFFICESTUDIO_FILE_CANVAS_PRESENTATION ||
     format === constants.AVS_OFFICESTUDIO_FILE_TEAMLAB_PPTY;
+};
+exports.isOOXFormat = function(format) {
+  return constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_DOCX === format
+  || constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_DOCM === format
+  || constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_DOTX === format
+  || constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_DOTM === format
+  || constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_OFORM === format
+  || constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_DOCXF === format
+  || constants.AVS_OFFICESTUDIO_FILE_PRESENTATION_PPTX === format
+  || constants.AVS_OFFICESTUDIO_FILE_PRESENTATION_PPSX === format
+  || constants.AVS_OFFICESTUDIO_FILE_PRESENTATION_PPTM === format
+  || constants.AVS_OFFICESTUDIO_FILE_PRESENTATION_PPSM === format
+  || constants.AVS_OFFICESTUDIO_FILE_PRESENTATION_POTX === format
+  || constants.AVS_OFFICESTUDIO_FILE_PRESENTATION_POTM === format
+  || constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLSX === format
+  || constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLSM === format
+  || constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLTX === format
+  || constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLTM === format;
 };

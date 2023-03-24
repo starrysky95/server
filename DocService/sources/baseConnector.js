@@ -38,22 +38,32 @@ var sqlDataBaseType = {
 	postgreSql	: 'postgres'
 };
 
-var config = require('config').get('services.CoAuthoring.sql');
-var baseConnector = (sqlDataBaseType.mySql === config.get('type') || sqlDataBaseType.mariaDB === config.get('type')) ? require('./mySqlBaseConnector') : require('./postgreSqlBaseConnector');
-var logger = require('./../../Common/sources/logger');
+var bottleneck = require("bottleneck");
+var config = require('config');
+var configSql = config.get('services.CoAuthoring.sql');
+var baseConnector = (sqlDataBaseType.mySql === configSql.get('type') || sqlDataBaseType.mariaDB === configSql.get('type')) ? require('./mySqlBaseConnector') : require('./postgreSqlBaseConnector');
+let constants = require('./../../Common/sources/constants');
 
-const tableChanges = config.get('tableChanges'),
-	tableResult = config.get('tableResult');
+const cfgTableResult = configSql.get('tableResult');
+const cfgTableChanges = configSql.get('tableChanges');
 
 var g_oCriticalSection = {};
 let isSupportFastInsert = !!baseConnector.insertChanges;
 let addSqlParam = baseConnector.addSqlParameter;
-var maxPacketSize = config.get('max_allowed_packet'); // Размер по умолчанию для запроса в базу данных 1Mb - 1 (т.к. он не пишет 1048575, а пишет 1048574)
+var maxPacketSize = configSql.get('max_allowed_packet'); // Размер по умолчанию для запроса в базу данных 1Mb - 1 (т.к. он не пишет 1048575, а пишет 1048574)
+const cfgBottleneckGetChanges = config.get('bottleneck.getChanges');
+
+let reservoirMaximum = cfgBottleneckGetChanges.reservoirIncreaseMaximum || cfgBottleneckGetChanges.reservoirRefreshAmount;
+let group = new bottleneck.Group(cfgBottleneckGetChanges);
+
+function getChangesSize(changes) {
+  return changes.reduce((accumulator, currentValue) => accumulator + currentValue.change_data.length, 0);
+}
 
 exports.baseConnector = baseConnector;
-exports.insertChangesPromiseCompatibility = function (objChanges, docId, index, user) {
+exports.insertChangesPromiseCompatibility = function (ctx, objChanges, docId, index, user) {
   return new Promise(function(resolve, reject) {
-    _insertChangesCallback(0, objChanges, docId, index, user, function(error, result) {
+    _insertChangesCallback(ctx, 0, objChanges, docId, index, user, function(error, result) {
       if (error) {
         reject(error);
       } else {
@@ -62,13 +72,13 @@ exports.insertChangesPromiseCompatibility = function (objChanges, docId, index, 
     });
   });
 };
-exports.insertChangesPromiseFast = function (objChanges, docId, index, user) {
+exports.insertChangesPromiseFast = function (ctx, objChanges, docId, index, user) {
   return new Promise(function(resolve, reject) {
-    baseConnector.insertChanges(tableChanges, 0, objChanges, docId, index, user, function(error, result, isSupported) {
+    baseConnector.insertChanges(ctx, cfgTableChanges, 0, objChanges, docId, index, user, function(error, result, isSupported) {
       isSupportFastInsert = isSupported;
       if (error) {
         if (!isSupportFastInsert) {
-          resolve(exports.insertChangesPromiseCompatibility(objChanges, docId, index, user));
+          resolve(exports.insertChangesPromiseCompatibility(ctx, objChanges, docId, index, user));
         } else {
           reject(error);
         }
@@ -78,11 +88,11 @@ exports.insertChangesPromiseFast = function (objChanges, docId, index, user) {
     });
   });
 };
-exports.insertChangesPromise = function (objChanges, docId, index, user) {
+exports.insertChangesPromise = function (ctx, objChanges, docId, index, user) {
   if (isSupportFastInsert) {
-    return exports.insertChangesPromiseFast(objChanges, docId, index, user);
+    return exports.insertChangesPromiseFast(ctx, objChanges, docId, index, user);
   } else {
-    return exports.insertChangesPromiseCompatibility(objChanges, docId, index, user);
+    return exports.insertChangesPromiseCompatibility(ctx, objChanges, docId, index, user);
   }
 
 };
@@ -92,8 +102,8 @@ function _getDateTime2(oDate) {
 
 exports.getDateTime = _getDateTime2;
 
-function _insertChangesCallback (startIndex, objChanges, docId, index, user, callback) {
-  var sqlCommand = `INSERT INTO ${tableChanges} VALUES`;
+function _insertChangesCallback (ctx, startIndex, objChanges, docId, index, user, callback) {
+  var sqlCommand = `INSERT INTO ${cfgTableChanges} VALUES`;
   var i = startIndex, l = objChanges.length, lengthUtf8Current = sqlCommand.length, lengthUtf8Row = 0, values = [];
   if (i === l)
     return;
@@ -105,13 +115,14 @@ function _insertChangesCallback (startIndex, objChanges, docId, index, user, cal
     if (lengthUtf8Row + lengthUtf8Current >= maxPacketSize && i > startIndex) {
       sqlCommand += ';';
       (function(tmpStart, tmpIndex) {
-        baseConnector.sqlQuery(sqlCommand, function() {
+        baseConnector.sqlQuery(ctx, sqlCommand, function() {
           // lock не снимаем, а продолжаем добавлять
-          _insertChangesCallback(tmpStart, objChanges, docId, tmpIndex, user, callback);
+          _insertChangesCallback(ctx, tmpStart, objChanges, docId, tmpIndex, user, callback);
         }, undefined, undefined, values);
       })(i, index);
       return;
     }
+    let p0 = addSqlParam(ctx.tenant, values);
     let p1 = addSqlParam(docId, values);
     let p2 = addSqlParam(index, values);
     let p3 = addSqlParam(user.id, values);
@@ -122,27 +133,28 @@ function _insertChangesCallback (startIndex, objChanges, docId, index, user, cal
     if (i > startIndex) {
       sqlCommand += ',';
     }
-    sqlCommand += `(${p1},${p2},${p3},${p4},${p5},${p6},${p7})`;
+    sqlCommand += `(${p0},${p1},${p2},${p3},${p4},${p5},${p6},${p7})`;
     lengthUtf8Current += lengthUtf8Row;
   }
 
   sqlCommand += ';';
-  baseConnector.sqlQuery(sqlCommand, callback, undefined, undefined, values);
+  baseConnector.sqlQuery(ctx, sqlCommand, callback, undefined, undefined, values);
 }
-exports.deleteChangesCallback = function(docId, deleteIndex, callback) {
+exports.deleteChangesCallback = function(ctx, docId, deleteIndex, callback) {
   let sqlCommand, values = [];
-  let sqlParam1 = addSqlParam(docId, values);
+  let p1 = addSqlParam(ctx.tenant, values);
+  let p2 = addSqlParam(docId, values);
   if (null !== deleteIndex) {
     let sqlParam2 = addSqlParam(deleteIndex, values);
-    sqlCommand = `DELETE FROM ${tableChanges} WHERE id=${sqlParam1} AND change_id >= ${sqlParam2};`;
+    sqlCommand = `DELETE FROM ${cfgTableChanges} WHERE tenant=${p1} AND id=${p2} AND change_id >= ${sqlParam2};`;
   } else {
-    sqlCommand = `DELETE FROM ${tableChanges} WHERE id=${sqlParam1};`;
+    sqlCommand = `DELETE FROM ${cfgTableChanges} WHERE tenant=${p1} AND id=${p2};`;
   }
-  baseConnector.sqlQuery(sqlCommand, callback, undefined, undefined, values);
+  baseConnector.sqlQuery(ctx, sqlCommand, callback, undefined, undefined, values);
 };
-exports.deleteChangesPromise = function (docId, deleteIndex) {
+exports.deleteChangesPromise = function (ctx, docId, deleteIndex) {
   return new Promise(function(resolve, reject) {
-    exports.deleteChangesCallback(docId, deleteIndex, function(error, result) {
+    exports.deleteChangesCallback(ctx, docId, deleteIndex, function(error, result) {
       if (error) {
         reject(error);
       } else {
@@ -151,21 +163,22 @@ exports.deleteChangesPromise = function (docId, deleteIndex) {
     });
   });
 };
-exports.deleteChanges = function (docId, deleteIndex) {
-	lockCriticalSection(docId, function () {_deleteChanges(docId, deleteIndex);});
+exports.deleteChanges = function (ctx, docId, deleteIndex) {
+	lockCriticalSection(docId, function () {_deleteChanges(ctx, docId, deleteIndex);});
 };
-function _deleteChanges (docId, deleteIndex) {
-  exports.deleteChangesCallback(docId, deleteIndex, function () {unLockCriticalSection(docId);});
+function _deleteChanges (ctx, docId, deleteIndex) {
+  exports.deleteChangesCallback(ctx, docId, deleteIndex, function () {unLockCriticalSection(docId);});
 }
-exports.getChangesIndex = function(docId, callback) {
+exports.getChangesIndex = function(ctx, docId, callback) {
   let values = [];
-  let sqlParam = addSqlParam(docId, values);
-  var sqlCommand = `SELECT MAX(change_id) as change_id FROM ${tableChanges} WHERE id=${sqlParam};`;
-  baseConnector.sqlQuery(sqlCommand, callback, undefined, undefined, values);
+  let p1 = addSqlParam(ctx.tenant, values);
+  let p2 = addSqlParam(docId, values);
+  var sqlCommand = `SELECT MAX(change_id) as change_id FROM ${cfgTableChanges} WHERE tenant=${p1} AND id=${p2};`;
+  baseConnector.sqlQuery(ctx, sqlCommand, callback, undefined, undefined, values);
 };
-exports.getChangesIndexPromise = function(docId) {
+exports.getChangesIndexPromise = function(ctx, docId) {
   return new Promise(function(resolve, reject) {
-    exports.getChangesIndex(docId, function(error, result) {
+    exports.getChangesIndex(ctx, docId, function(error, result) {
       if (error) {
         reject(error);
       } else {
@@ -174,52 +187,48 @@ exports.getChangesIndexPromise = function(docId) {
     });
   });
 };
-exports.getChangesPromise = function (docId, optStartIndex, optEndIndex, opt_time) {
-  return new Promise(function(resolve, reject) {
-    let values = [];
-    let sqlParam = addSqlParam(docId, values);
-    let sqlWhere = `id=${sqlParam}`;
-    if (null != optStartIndex) {
-      sqlParam = addSqlParam(optStartIndex, values);
-      sqlWhere += ` AND change_id>=${sqlParam}`;
-    }
-    if (null != optEndIndex) {
-      sqlParam = addSqlParam(optEndIndex, values);
-      sqlWhere += ` AND change_id<${sqlParam}`;
-    }
-    if (null != opt_time) {
-      if (!(opt_time instanceof Date)) {
-        opt_time = new Date(opt_time);
+exports.getChangesPromise = function (ctx, docId, optStartIndex, optEndIndex, opt_time) {
+  let limiter = group.key(`${ctx.tenant}\t${docId}\tchanges`);
+  return limiter.schedule(() => {
+    return new Promise(function(resolve, reject) {
+      let values = [];
+      let sqlParam = addSqlParam(ctx.tenant, values);
+      let sqlWhere = `tenant=${sqlParam}`;
+      sqlParam = addSqlParam(docId, values);
+      sqlWhere += ` AND id=${sqlParam}`;
+      if (null != optStartIndex) {
+        sqlParam = addSqlParam(optStartIndex, values);
+        sqlWhere += ` AND change_id>=${sqlParam}`;
       }
-      sqlParam = addSqlParam(opt_time, values);
-      sqlWhere += ` AND change_date<=${sqlParam}`;
-    }
-    sqlWhere += ' ORDER BY change_id ASC';
-    var sqlCommand = `SELECT * FROM ${tableChanges} WHERE ${sqlWhere};`;
+      if (null != optEndIndex) {
+        sqlParam = addSqlParam(optEndIndex, values);
+        sqlWhere += ` AND change_id<${sqlParam}`;
+      }
+      if (null != opt_time) {
+        if (!(opt_time instanceof Date)) {
+          opt_time = new Date(opt_time);
+        }
+        sqlParam = addSqlParam(opt_time, values);
+        sqlWhere += ` AND change_date<=${sqlParam}`;
+      }
+      sqlWhere += ' ORDER BY change_id ASC';
+      var sqlCommand = `SELECT * FROM ${cfgTableChanges} WHERE ${sqlWhere};`;
 
-    baseConnector.sqlQuery(sqlCommand, function(error, result) {
-      if (error) {
-        reject(error);
-      } else {
-        resolve(result);
-      }
-    }, undefined, undefined, values);
-  });
-};
-exports.checkStatusFile = function (docId, callbackFunction) {
-  let values = [];
-  let sqlParam = addSqlParam(docId, values);
-  var sqlCommand = `SELECT status, status_info FROM ${tableResult} WHERE id=${sqlParam};`;
-  baseConnector.sqlQuery(sqlCommand, callbackFunction, undefined, undefined, values);
-};
-exports.checkStatusFilePromise = function (docId) {
-  return new Promise(function(resolve, reject) {
-    exports.checkStatusFile(docId, function(error, result) {
-      if (error) {
-        reject(error);
-      } else {
-        resolve(result);
-      }
+      baseConnector.sqlQuery(ctx, sqlCommand, function(error, result) {
+        if (error) {
+          reject(error);
+        } else {
+          if (reservoirMaximum > 0) {
+            let size = Math.min(getChangesSize(result), reservoirMaximum);
+            let cur = limiter.incrementReservoir(-size).then((cur) => {
+              ctx.logger.debug("getChangesPromise bottleneck reservoir cur=%s", cur);
+              resolve(result);
+            });
+          } else {
+            resolve(result);
+          }
+        }
+      }, undefined, undefined, values);
     });
   });
 };
@@ -248,11 +257,11 @@ function unLockCriticalSection (id) {
 	else
 		delete g_oCriticalSection[id];
 }
-exports.healthCheck = function () {
+exports.healthCheck = function (ctx) {
   return new Promise(function(resolve, reject) {
   	//SELECT 1; usefull for H2, MySQL, Microsoft SQL Server, PostgreSQL, SQLite
   	//http://stackoverflow.com/questions/3668506/efficient-sql-test-query-or-validation-query-that-will-work-across-all-or-most
-    baseConnector.sqlQuery('SELECT 1;', function(error, result) {
+    baseConnector.sqlQuery(ctx, 'SELECT 1;', function(error, result) {
       if (error) {
         reject(error);
       } else {
@@ -262,10 +271,22 @@ exports.healthCheck = function () {
   });
 };
 
-exports.getEmptyCallbacks = function() {
+exports.getEmptyCallbacks = function(ctx) {
   return new Promise(function(resolve, reject) {
-    const sqlCommand = "SELECT DISTINCT t1.id FROM doc_changes t1 LEFT JOIN task_result t2 ON t2.id = t1.id WHERE t2.callback = '';";
-    baseConnector.sqlQuery(sqlCommand, function(error, result) {
+    const sqlCommand = `SELECT DISTINCT t1.tenant, t1.id FROM ${cfgTableChanges} t1 LEFT JOIN ${cfgTableResult} t2 ON t2.tenant = t1.tenant AND t2.id = t1.id WHERE t2.callback = '';`;
+    baseConnector.sqlQuery(ctx, sqlCommand, function(error, result) {
+      if (error) {
+        reject(error);
+      } else {
+        resolve(result);
+      }
+    });
+  });
+};
+exports.getTableColumns = function(ctx, tableName) {
+  return new Promise(function(resolve, reject) {
+    const sqlCommand = `SELECT column_name FROM information_schema.COLUMNS WHERE TABLE_NAME = '${tableName}';`;
+    baseConnector.sqlQuery(ctx, sqlCommand, function(error, result) {
       if (error) {
         reject(error);
       } else {
@@ -286,12 +307,12 @@ UserCallback.prototype.fromValues = function(userIndex, callback){
     this.callback = callback;
   }
 };
-UserCallback.prototype.delimiter = String.fromCharCode(5);
+UserCallback.prototype.delimiter = constants.CHAR_DELIMITER;
 UserCallback.prototype.toSQLInsert = function(){
   return this.delimiter + JSON.stringify(this);
 };
-UserCallback.prototype.getCallbackByUserIndex = function(docId, callbacksStr, opt_userIndex) {
-  logger.debug("getCallbackByUserIndex: docId = %s userIndex = %s callbacks = %s", docId, opt_userIndex, callbacksStr);
+UserCallback.prototype.getCallbackByUserIndex = function(ctx, callbacksStr, opt_userIndex) {
+  ctx.logger.debug("getCallbackByUserIndex: userIndex = %s callbacks = %s", opt_userIndex, callbacksStr);
   if (!callbacksStr || !callbacksStr.startsWith(UserCallback.prototype.delimiter)) {
     let index = callbacksStr.indexOf(UserCallback.prototype.delimiter);
     if (-1 === index) {
@@ -313,8 +334,8 @@ UserCallback.prototype.getCallbackByUserIndex = function(docId, callbacksStr, op
   }
   return callbackUrl;
 };
-UserCallback.prototype.getCallbacks = function(docId, callbacksStr) {
-  logger.debug("getCallbacks: docId = %s callbacks = %s", docId, callbacksStr);
+UserCallback.prototype.getCallbacks = function(ctx, callbacksStr) {
+  ctx.logger.debug("getCallbacks: callbacks = %s", callbacksStr);
   if (!callbacksStr || !callbacksStr.startsWith(UserCallback.prototype.delimiter)) {
     let index = callbacksStr.indexOf(UserCallback.prototype.delimiter);
     if (-1 === index) {
@@ -351,17 +372,17 @@ DocumentPassword.prototype.fromValues = function(password, change){
     this.change = change;
   }
 };
-DocumentPassword.prototype.delimiter = String.fromCharCode(5);
+DocumentPassword.prototype.delimiter = constants.CHAR_DELIMITER;
 DocumentPassword.prototype.toSQLInsert = function(){
   return this.delimiter + JSON.stringify(this);
 };
 DocumentPassword.prototype.isInitial = function(){
   return !this.change;
 };
-DocumentPassword.prototype.getDocPassword = function(docId, docPasswordStr) {
+DocumentPassword.prototype.getDocPassword = function(ctx, docPasswordStr) {
   let res = {initial: undefined, current: undefined, change: undefined};
   if (docPasswordStr) {
-    logger.debug("getDocPassword: docId = %s passwords = %s", docId, docPasswordStr);
+    ctx.logger.debug("getDocPassword: passwords = %s", docPasswordStr);
     let passwords = docPasswordStr.split(UserCallback.prototype.delimiter);
 
     for (let i = 1; i < passwords.length; ++i) {
@@ -377,12 +398,53 @@ DocumentPassword.prototype.getDocPassword = function(docId, docPasswordStr) {
   }
   return res;
 };
-DocumentPassword.prototype.getCurPassword = function(docId, docPasswordStr) {
-  let docPassword = this.getDocPassword(docId, docPasswordStr);
+DocumentPassword.prototype.getCurPassword = function(ctx, docPasswordStr) {
+  let docPassword = this.getDocPassword(ctx, docPasswordStr);
   return docPassword.current;
 };
-DocumentPassword.prototype.hasPasswordChanges = function(docId, docPasswordStr) {
-  let docPassword = this.getDocPassword(docId, docPasswordStr);
+DocumentPassword.prototype.hasPasswordChanges = function(ctx, docPasswordStr) {
+  let docPassword = this.getDocPassword(ctx, docPasswordStr);
   return docPassword.initial !== docPassword.current;
 };
 exports.DocumentPassword = DocumentPassword;
+
+function DocumentAdditional() {
+  this.data = [];
+}
+DocumentAdditional.prototype.delimiter = constants.CHAR_DELIMITER;
+DocumentAdditional.prototype.toSQLInsert = function() {
+  if (this.data.length) {
+    let vals = this.data.map((currentValue) => {
+      return JSON.stringify(currentValue);
+    });
+    return this.delimiter + vals.join(this.delimiter);
+  } else {
+    return null;
+  }
+};
+DocumentAdditional.prototype.fromString = function(str) {
+  if (!str) {
+    return;
+  }
+  let vals = str.split(this.delimiter).slice(1);
+  this.data = vals.map((currentValue) => {
+    return JSON.parse(currentValue);
+  });
+};
+DocumentAdditional.prototype.setOpenedAt = function(time, timezoneOffset) {
+  let additional = new DocumentAdditional();
+  additional.data.push({time: time, timezoneOffset: timezoneOffset});
+  return additional.toSQLInsert();
+};
+DocumentAdditional.prototype.getOpenedAt = function(str) {
+  let res;
+  let val = new DocumentAdditional();
+  val.fromString(str);
+  val.data.forEach((elem) => {
+    if (undefined !== elem.timezoneOffset) {
+      res = elem.time - (elem.timezoneOffset * 60 * 1000);
+    }
+  });
+  return res;
+};
+exports.DocumentAdditional = DocumentAdditional;

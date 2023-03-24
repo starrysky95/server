@@ -72,6 +72,11 @@ function InputCommand(data, copyExplicit) {
     } else {
       this['thumbnail'] = undefined;
     }
+    if (data['textParams']) {
+      this['textParams'] = new CTextParams(data['textParams']);
+    } else {
+      this['textParams'] = undefined;
+    }
     this['status'] = data['status'];
     this['status_info'] = data['status_info'];
     this['savekey'] = data['savekey'];
@@ -100,6 +105,7 @@ function InputCommand(data, copyExplicit) {
     this['forgotten'] = data['forgotten'];
     this['status_info_in'] = data['status_info_in'];
     this['attempt'] = data['attempt'];
+    this['convertToOrigin'] = data['convertToOrigin'];
     if (copyExplicit) {
       this['withAuthorization'] = data['withAuthorization'];
       this['isbuilder'] = data['isbuilder'];
@@ -158,6 +164,7 @@ function InputCommand(data, copyExplicit) {
     this['forgotten'] = undefined;
     this['status_info_in'] = undefined;
     this['attempt'] = undefined;
+    this['convertToOrigin'] = undefined;
   }
 }
 InputCommand.prototype = {
@@ -286,6 +293,12 @@ InputCommand.prototype = {
   },
   setThumbnail: function(data) {
     this['thumbnail'] = data;
+  },
+  getTextParams: function() {
+    return this['textParams'];
+  },
+  setTextParams: function(data) {
+    this['textParams'] = data;
   },
   getStatus: function() {
     return this['status'];
@@ -454,6 +467,12 @@ InputCommand.prototype = {
   },
   setWopiParams: function(data) {
     this['wopiParams'] = data;
+  },
+  getConvertToOrigin: function() {
+    return this['convertToOrigin'];
+  },
+  setConvertToOrigin: function(data) {
+    this['convertToOrigin'] = data;
   }
 };
 
@@ -547,6 +566,19 @@ CThumbnailData.prototype.getHeight = function() {
 };
 CThumbnailData.prototype.setHeight = function(v) {
   this['height'] = v;
+};
+function CTextParams(obj) {
+  if (obj) {
+    this['association'] = obj['association'];
+  } else {
+    this['association'] = null;
+  }
+}
+CTextParams.prototype.getAssociation = function() {
+  return this['association']
+};
+CTextParams.prototype.setAssociation = function(v) {
+  this['association'] = v;
 };
 
 function CMailMergeSendData(obj) {
@@ -676,6 +708,7 @@ CMailMergeSendData.prototype.setIsJsonKey = function(v) {
 };
 function TaskQueueData(data) {
   if (data) {
+    this['ctx'] = data['ctx'];
     this['cmd'] = new InputCommand(data['cmd'], true);
     this['toFile'] = data['toFile'];
     this['fromOrigin'] = data['fromOrigin'];
@@ -686,6 +719,7 @@ function TaskQueueData(data) {
     this['dataKey'] = data['dataKey'];
     this['visibilityTimeout'] = data['visibilityTimeout'];
   } else {
+    this['ctx'] = undefined;
     this['cmd'] = undefined;
     this['toFile'] = undefined;
     this['fromOrigin'] = undefined;
@@ -698,6 +732,12 @@ function TaskQueueData(data) {
   }
 }
 TaskQueueData.prototype = {
+  getCtx : function() {
+    return this['ctx'];
+  },
+  setCtx : function(data) {
+    return this['ctx'] = data;
+  },
   getCmd : function() {
     return this['cmd'];
   },
@@ -762,6 +802,8 @@ function OutputSfcData(key) {
   this['notmodified'] = undefined;
   this['forcesavetype'] = undefined;
   this['encrypted'] = undefined;
+
+  this['token'] = undefined;
 }
 OutputSfcData.prototype.getKey = function() {
   return this['key'];
@@ -847,6 +889,12 @@ OutputSfcData.prototype.getEncrypted = function() {
 OutputSfcData.prototype.setEncrypted = function(v) {
   this['encrypted'] = v;
 };
+OutputSfcData.prototype.getToken = function() {
+  return this['token']
+};
+OutputSfcData.prototype.setToken = function(v) {
+  this['token'] = v;
+};
 
 function OutputMailMerge(mailMergeSendData) {
   if (mailMergeSendData) {
@@ -856,7 +904,7 @@ function OutputMailMerge(mailMergeSendData) {
     this['title'] = mailMergeSendData.getFileName();
     const mailFormat = mailMergeSendData.getMailFormat();
     switch (mailFormat) {
-      case constants.AVS_OFFICESTUDIO_FILE_OTHER_HTMLZIP :
+      case constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_HTML :
         this['type'] = 0;
         break;
       case constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_DOCX :
@@ -1062,6 +1110,17 @@ const c_oAscUnlockRes = {
   Unlocked: 1,
   Empty: 2
 };
+const FileStatus = {
+  None: 0,
+  Ok: 1,
+  WaitQueue: 2,
+  NeedParams: 3,
+  Err: 5,
+  ErrToReload: 6,
+  SaveVersion: 7,
+  UpdateVersion: 8,
+  NeedPassword: 9
+};
 
 const buildVersion = '4.1.2';
 const buildNumber = 37;
@@ -1069,6 +1128,7 @@ const buildNumber = 37;
 exports.TaskQueueData = TaskQueueData;
 exports.CMailMergeSendData = CMailMergeSendData;
 exports.CThumbnailData = CThumbnailData;
+exports.CTextParams = CTextParams;
 exports.CForceSaveData = CForceSaveData;
 exports.InputCommand = InputCommand;
 exports.OutputSfcData = OutputSfcData;
@@ -1087,5 +1147,6 @@ exports.c_oAscUrlTypes = c_oAscUrlTypes;
 exports.c_oAscSecretType = c_oAscSecretType;
 exports.c_oAscQueueType = c_oAscQueueType;
 exports.c_oAscUnlockRes = c_oAscUnlockRes;
+exports.FileStatus = FileStatus;
 exports.buildVersion = buildVersion;
 exports.buildNumber = buildNumber;
